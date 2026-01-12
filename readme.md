@@ -2,9 +2,9 @@
 
 **MIDI over HTTP — simple, powerful, and cross-platform.**
 
-Midi Relay Hub lets you send and receive MIDI messages across a network using JSON-based HTTP requests. Built for church production, automation, and integration with tools like [Bitfocus Companion](https://bitfocus.io/companion) and [n8n](https://n8n.io).
+Midi Relay Hub lets you send and receive MIDI messages across a network using JSON-based HTTP requests. Built for AV and stage production (Church, Concerts, stage shows, plays, etc), automation, and integration with tools like streamdeck, [Bitfocus Companion](https://bitfocus.io/companion) and [n8n](https://n8n.io).
 
-> 🎹 *Forked from [midi-relay](https://github.com/josephdadams/midi-relay) by Joseph Adams*
+> 🎹 *The base of the project is pulled/Forked from [midi-relay](https://github.com/josephdadams/midi-relay) by Joseph Adams*
 
 ---
 
