@@ -1,201 +1,373 @@
-//MIDI library variables
-const midi = require('midi')
+'use strict'
 
-const request = require('request')
-const http = require('http')
+/**
+ * MIDI Engine using JZZ.js
+ *
+ * This is a drop-in replacement for the node-midi based implementation.
+ * JZZ.js provides:
+ * - Active maintenance and MIDI 2.0 support
+ * - Helper functions (noteOn, cc, etc.)
+ * - Better async/await support
+ * - Cross-platform compatibility
+ */
+
+const JZZ = require('jzz')
 
 const notifications = require('./notifications.js')
 const contextmenu = require('./contextmenu.js')
-
 const config = require('./config.js')
-
 const _ = require('lodash')
 
-let virtualOutput = new midi.Output()
-let virtualInput = new midi.Input()
+// =============================================================================
+// Logging
+// =============================================================================
 
-function createVirtualMIDIPort() {
+function addToLog(direction, port, command, data) {
+	const logEntry = {
+		timestamp: new Date().toISOString(),
+		direction: direction,
+		port: port,
+		command: command,
+		data: data,
+	}
+
+	global.MIDIRelaysLog.push(logEntry)
+
+	if (global.MIDIRelaysLog.length > 500) {
+		global.MIDIRelaysLog.shift()
+	}
+
+	if (global.sendLog) {
+		global.sendLog(logEntry)
+	}
+}
+
+// =============================================================================
+// JZZ Engine State
+// =============================================================================
+
+let jzzEngine = null
+let virtualInPort = null
+let virtualOutPort = null
+const openInputs = new Map() // portName -> JZZ input port
+const openOutputs = new Map() // portName -> JZZ output port
+
+// =============================================================================
+// Engine Initialization
+// =============================================================================
+
+async function initEngine() {
+	if (jzzEngine) return jzzEngine
+
 	try {
-		virtualOutput.openVirtualPort('midi-relay')
-		virtualInput.openVirtualPort('midi-relay')
+		jzzEngine = await JZZ()
+		console.log('JZZ MIDI engine initialized')
+		return jzzEngine
+	} catch (error) {
+		console.error('Failed to initialize JZZ MIDI engine:', error)
+		throw error
+	}
+}
 
-		virtualInput.ignoreTypes(false, false, false)
+// =============================================================================
+// Virtual MIDI Ports
+// =============================================================================
 
-		virtualInput.on('message', (deltaTime, message) => {
-			console.log('virtual message received:')
-			console.log(message)
-			receiveMIDI('midi-relay', message)
+async function createVirtualMIDIPort() {
+	try {
+		await initEngine()
+
+		// Create a virtual input widget that receives MIDI and processes it
+		const inputWidget = JZZ.Widget({
+			_receive: function (msg) {
+				console.log('virtual message received:', msg.toString())
+				receiveMIDI('midi-relay-hub', Array.from(msg))
+			},
 		})
+
+		// Create virtual output widget
+		const outputWidget = JZZ.Widget()
+
+		// Register as virtual ports
+		JZZ.addMidiIn('midi-relay-hub', inputWidget)
+		JZZ.addMidiOut('midi-relay-hub', outputWidget)
+
+		virtualInPort = inputWidget
+		virtualOutPort = outputWidget
 
 		notifications.showNotification({
 			title: 'Virtual MIDI Port',
-			body: 'Virtual MIDI Port Created: midi-relay',
+			body: 'Virtual MIDI Port Created: midi-relay-hub',
 			showNotification: true,
 		})
 	} catch (error) {
-		console.warn('Virtual ports not supported on this platform or failed to create:', error.message)
+		console.warn('Virtual ports not supported or failed to create:', error.message)
 		notifications.showNotification({
 			title: 'Virtual MIDI Port Error',
-			body: 'Unable to create virtual MIDI port. Virtual ports not supported on this platform or failed to create.',
+			body: 'Unable to create virtual MIDI port.',
 			showNotification: true,
 		})
 	}
 }
 
-const inputMap = new Map()
-const outputMap = new Map()
+// =============================================================================
+// Port Management
+// =============================================================================
 
-function GetPorts(showNotification) {
+async function GetPorts(showNotification) {
 	global.MIDI_OUTPUTS = []
 	global.MIDI_INPUTS = []
 
-	const output = new midi.Output()
-	const input = new midi.Input()
+	try {
+		const engine = await initEngine()
 
-	for (let i = 0; i < output.getPortCount(); i++) {
-		const name = output.getPortName(i)
-		global.MIDI_OUTPUTS.push({ id: name, name })
-		outputMap.set(name, i)
-	}
+		// Get output ports
+		const outputs = engine.info().outputs
+		outputs.forEach((port, index) => {
+			global.MIDI_OUTPUTS.push({
+				id: port.name,
+				name: port.name,
+				manufacturer: port.manufacturer || '',
+			})
+		})
 
-	for (let i = 0; i < input.getPortCount(); i++) {
-		const name = input.getPortName(i)
-		const alreadyExists = global.MIDI_INPUTS.find((p) => p.name === name)
-		if (!alreadyExists) {
-			global.MIDI_INPUTS.push({ id: i, name, opened: false })
+		// Get input ports
+		const inputs = engine.info().inputs
+		inputs.forEach((port, index) => {
+			const alreadyExists = global.MIDI_INPUTS.find((p) => p.name === port.name)
+			if (!alreadyExists) {
+				global.MIDI_INPUTS.push({
+					id: index,
+					name: port.name,
+					manufacturer: port.manufacturer || '',
+					opened: openInputs.has(port.name),
+				})
+			}
+		})
+
+		// Open ports that should be open
+		const portsToOpen = global.MIDI_INPUTS.filter((port) => !isInputDisabled(port.name) && !port.opened)
+		for (const port of portsToOpen) {
+			await OpenPort(port.name)
 		}
+
+		loadMIDITriggers()
+
+		if (showNotification) {
+			const bodyText = global.MIDI_OUTPUTS.map((port) => port.name).join('\n')
+			notifications.showNotification({
+				title: `${global.MIDI_OUTPUTS.length} MIDI Output Ports Found.`,
+				body: bodyText,
+				showNotification: true,
+			})
+		}
+
+		contextmenu.buildContextMenu()
+	} catch (error) {
+		console.error('Error scanning MIDI ports:', error)
+	}
+}
+
+async function OpenPort(portName) {
+	if (openInputs.has(portName)) {
+		return // Already open
 	}
 
-	let portsToOpen = global.MIDI_INPUTS.filter((port) => !isInputDisabled(port.id) && !port.opened)
-	portsToOpen.forEach((port) => OpenPort(port.name))
+	try {
+		const engine = await initEngine()
+		const input = await engine.openMidiIn(portName)
 
-	loadMIDITriggers()
+		input.connect(function (msg) {
+			receiveMIDI(portName, Array.from(msg))
+		})
 
-	if (showNotification) {
-		let bodyText = global.MIDI_OUTPUTS.map((port) => port.name).join('\n')
+		openInputs.set(portName, input)
+
+		const port = global.MIDI_INPUTS.find((p) => p.name === portName)
+		if (port) port.opened = true
+
 		notifications.showNotification({
-			title: `${global.MIDI_OUTPUTS.length} MIDI Output Ports Found.`,
-			body: bodyText,
+			title: `MIDI Port Opened: ${portName}`,
+			body: `MIDI Port Opened: ${portName}`,
 			showNotification: true,
 		})
+	} catch (error) {
+		console.warn(`Error opening MIDI port ${portName}:`, error.message)
 	}
-
-	contextmenu.buildContextMenu()
 }
 
-function OpenPort(portName) {
-	if (inputMap.has(portName)) {
-		// Already opened
-		return
-	}
+async function ClosePort(portName) {
+	const input = openInputs.get(portName)
+	if (input) {
+		try {
+			await input.close()
+			openInputs.delete(portName)
 
-	const input = new midi.Input()
-	const portCount = input.getPortCount()
-
-	for (let i = 0; i < portCount; i++) {
-		if (input.getPortName(i) === portName) {
-			try {
-				input.openPort(i)
-				input.ignoreTypes(false, false, false)
-
-				input.on('message', (deltaTime, message) => {
-					receiveMIDI(portName, message)
-				})
-
-				inputMap.set(portName, input)
-
-				let port = global.MIDI_INPUTS.find((p) => p.name === portName)
-				if (port) port.opened = true
-
-				notifications.showNotification({
-					title: `MIDI Port Opened: ${portName}`,
-					body: `MIDI Port Opened: ${portName}`,
-					showNotification: true,
-				})
-			} catch (err) {
-				console.warn(`Error opening MIDI port ${portName}:`, err)
-			}
-			break
+			const port = global.MIDI_INPUTS.find((p) => p.name === portName)
+			if (port) port.opened = false
+		} catch (error) {
+			console.warn(`Error closing MIDI port ${portName}:`, error.message)
 		}
 	}
 }
 
-function refreshPorts(showNotification) {
+async function refreshPorts(showNotification) {
 	try {
-		GetPorts(showNotification)
+		await GetPorts(showNotification)
 	} catch (error) {
-		//emit error
+		console.error('Error refreshing ports:', error)
 	}
 }
 
-function sendMIDI(midiObj, callback) {
-	const portIndex = outputMap.get(midiObj.midiport)
-	if (typeof portIndex !== 'number') {
-		callback({ result: 'invalid-midi-port' })
-		return
+// =============================================================================
+// MIDI Sending
+// =============================================================================
+
+async function sendMIDI(midiObj, callback) {
+	try {
+		const engine = await initEngine()
+
+		// Get or open the output port
+		let output = openOutputs.get(midiObj.midiport)
+		if (!output) {
+			output = await engine.openMidiOut(midiObj.midiport)
+			openOutputs.set(midiObj.midiport, output)
+		}
+
+		let message = []
+
+		switch (midiObj.midicommand.toLowerCase()) {
+			case 'noteon':
+				// JZZ helper: noteOn(channel, note, velocity)
+				message = [0x90 + midiObj.channel, midiObj.note, midiObj.velocity || 127]
+				break
+			case 'noteoff':
+				message = [0x80 + midiObj.channel, midiObj.note, midiObj.velocity || 0]
+				break
+			case 'cc':
+				message = [0xb0 + midiObj.channel, midiObj.controller, midiObj.value]
+				break
+			case 'pc':
+				message = [0xc0 + midiObj.channel, midiObj.value]
+				break
+			case 'pressure':
+				message = [0xd0 + midiObj.channel, midiObj.value]
+				break
+			case 'pitchbend':
+				const lsb = midiObj.value & 0x7f
+				const msb = (midiObj.value >> 7) & 0x7f
+				message = [0xe0 + midiObj.channel, lsb, msb]
+				break
+			case 'sysex':
+				message = midiObj.message.split(',').map((v) => parseInt(v.trim()))
+				break
+			case 'msc':
+				message = BuildMSC(
+					midiObj.deviceid,
+					midiObj.commandformat,
+					midiObj.command,
+					midiObj.cue,
+					midiObj.cuelist,
+					midiObj.cuepath,
+				)
+				break
+			default:
+				callback({ result: 'invalid-midi-command' })
+				return
+		}
+
+		// Send the message
+		output.send(message)
+		addToLog('TX', midiObj.midiport, midiObj.midicommand, midiObj)
+		callback({ result: 'midi-sent-successfully', midiObj, message })
+	} catch (error) {
+		console.error('Error sending MIDI:', error)
+		callback({ result: 'error', error: error.message })
 	}
+}
 
-	const output = new midi.Output()
-	output.openPort(portIndex)
+// =============================================================================
+// MIDI Receiving
+// =============================================================================
 
-	let message = []
+function receiveMIDI(portName, message) {
+	if (!message || message.length === 0) return
 
-	switch (midiObj.midicommand.toLowerCase()) {
-		case 'noteon':
-			message = [0x90 + midiObj.channel, midiObj.note, midiObj.velocity || 127]
+	const statusByte = message[0]
+	const channel = statusByte & 0x0f
+	const command = statusByte & 0xf0
+
+	let midiType = ''
+	let midiData = { channel, raw: message }
+
+	switch (command) {
+		case 0x90: // Note On
+			midiType = message[2] > 0 ? 'noteon' : 'noteoff'
+			midiData.note = message[1]
+			midiData.velocity = message[2]
 			break
-		case 'noteoff':
-			message = [0x80 + midiObj.channel, midiObj.note, midiObj.velocity || 0]
+		case 0x80: // Note Off
+			midiType = 'noteoff'
+			midiData.note = message[1]
+			midiData.velocity = message[2]
 			break
-		case 'cc':
-			message = [0xb0 + midiObj.channel, midiObj.controller, midiObj.value]
+		case 0xb0: // CC
+			midiType = 'cc'
+			midiData.controller = message[1]
+			midiData.value = message[2]
 			break
-		case 'pc':
-			message = [0xc0 + midiObj.channel, midiObj.value]
+		case 0xc0: // Program Change
+			midiType = 'pc'
+			midiData.value = message[1]
 			break
-		case 'pressure':
-			message = [0xd0 + midiObj.channel, midiObj.value]
+		case 0xd0: // Channel Pressure
+			midiType = 'pressure'
+			midiData.value = message[1]
 			break
-		case 'pitchbend':
-			const lsb = midiObj.value & 0x7f
-			const msb = (midiObj.value >> 7) & 0x7f
-			message = [0xe0 + midiObj.channel, lsb, msb]
+		case 0xe0: // Pitch Bend
+			midiType = 'pitchbend'
+			midiData.value = message[1] | (message[2] << 7)
 			break
-		case 'sysex':
-			message = midiObj.message.split(',').map((v) => parseInt(v))
-			break
-		case 'msc':
-			message = BuildMSC(
-				midiObj.deviceid,
-				midiObj.commandformat,
-				midiObj.command,
-				midiObj.cue,
-				midiObj.cuelist,
-				midiObj.cuepath,
-			)
+		case 0xf0: // System messages
+			if (statusByte === 0xf0) {
+				midiType = 'sysex'
+				midiData.message = message
+				// Check for MSC
+				if (message.length >= 5 && message[1] === 0x7f && message[3] === 0x02) {
+					midiType = 'msc'
+					midiData = parseMSC(message)
+				}
+			}
 			break
 		default:
-			callback({ result: 'invalid-midi-command' })
-			return
+			midiType = 'unknown'
 	}
 
-	try {
-		output.sendMessage(message)
-		callback({ result: 'midi-sent-successfully', midiObj, message })
-	} catch (err) {
-		callback({ result: 'error', error: err.message })
-	} finally {
-		output.closePort()
+	if (midiType && midiType !== 'unknown') {
+		addToLog('RX', portName, midiType, midiData)
+
+		// Send to connected clients
+		if (global.sendMIDIBack) {
+			global.sendMIDIBack({
+				port: portName,
+				type: midiType,
+				...midiData,
+			})
+		}
+
+		// Check triggers
+		processMIDITriggers(portName, midiType, midiData)
 	}
 }
+
+// =============================================================================
+// MSC (MIDI Show Control)
+// =============================================================================
 
 function BuildMSC(deviceId, commandFormat, command, cue, cueList, cuePath) {
 	let deviceId_hex = null
 	let commandFormat_hex = null
 	let command_hex = null
-	let cue_hex = null
-	let cueList_hex = null
-	let cuePath_hex = null
 
 	try {
 		deviceId_hex = isNaN(parseInt(deviceId)) ? parseStringDeviceId(deviceId) : parseIntegerDeviceId(parseInt(deviceId))
@@ -204,406 +376,252 @@ function BuildMSC(deviceId, commandFormat, command, cue, cueList, cuePath) {
 		return []
 	}
 
-	switch (commandFormat) {
-		case 'lighting.general':
-			commandFormat_hex = 0x01
-			break
-		case 'sound.general':
-			commandFormat_hex = 0x10
-			break
-		case 'machinery.general':
-			commandFormat_hex = 0x20
-			break
-		case 'video.general':
-			commandFormat_hex = 0x30
-			break
-		case 'projection.general':
-			commandFormat_hex = 0x40
-			break
-		case 'processcontrol.general':
-			commandFormat_hex = 0x50
-			break
-		case 'pyro.general':
-			commandFormat_hex = 0x60
-			break
-		default:
-			commandFormat_hex = 0x7f
-			break
+	// Command Format mapping
+	const formatMap = {
+		'lighting.general': 0x01,
+		'sound.general': 0x10,
+		'machinery.general': 0x20,
+		'video.general': 0x30,
+		'projection.general': 0x40,
+		'processcontrol.general': 0x50,
+		'pyro.general': 0x60,
+	}
+	commandFormat_hex = formatMap[commandFormat] || 0x7f
+
+	// Command mapping
+	const commandMap = {
+		go: 0x01,
+		stop: 0x02,
+		resume: 0x03,
+		timedgo: 0x04,
+		load: 0x05,
+		set: 0x06,
+		fire: 0x07,
+		alloff: 0x08,
+		restore: 0x09,
+		reset: 0x0a,
+		gooff: 0x0b,
+		gojam: 0x10,
+	}
+	command_hex = commandMap[command] || 0x01
+
+	// Build message
+	const msg = [0xf0, 0x7f, deviceId_hex, 0x02, commandFormat_hex, command_hex]
+
+	// Add cue data if present
+	if (cue) {
+		const cueBytes = stringToMSCData(cue)
+		msg.push(...cueBytes)
+	}
+	if (cueList) {
+		msg.push(0x00) // separator
+		const listBytes = stringToMSCData(cueList)
+		msg.push(...listBytes)
+	}
+	if (cuePath) {
+		msg.push(0x00)
+		const pathBytes = stringToMSCData(cuePath)
+		msg.push(...pathBytes)
 	}
 
-	switch (command) {
-		case 'go':
-			command_hex = 0x01
-			break
-		case 'stop':
-			command_hex = 0x02
-			break
-		case 'gojam':
-			command_hex = 0x10
-			break
-		case 'resume':
-			command_hex = 0x03
-			break
-		case 'timedgo':
-			command_hex = 0x04
-			break
-		case 'load':
-			command_hex = 0x05
-			break
-		case 'set':
-			command_hex = 0x06
-			break
-		case 'fire':
-			command_hex = 0x07
-			break
-		case 'alloff':
-			command_hex = 0x08
-			break
-		case 'restore':
-			command_hex = 0x09
-			break
-		case 'reset':
-			command_hex = 0x0a
-			break
-		case 'gooff':
-			command_hex = 0x0b
-			break
-		case 'opencuelist':
-			command_hex = 0x01b
-			break
-		case 'closecuelist':
-			command_hex = 0x01c
-			break
-		case 'startclock':
-			command_hex = 0x015
-			break
-		case 'stopclock':
-			command_hex = 0x016
-			break
-		default:
-			command_hex = 0x01
-			break
-	}
-
-	if (cue !== '' && cue !== undefined) {
-		cue_hex = stringToByteArray(cue)
-	}
-
-	if (cueList !== '' && cueList !== undefined) {
-		cueList_hex = stringToByteArray(cueList)
-	}
-
-	if (cuePath !== '' && cuePath !== undefined) {
-		cuePath_hex = stringToByteArray(cuePath)
-	}
-
-	var message = [0xf0, 0x7f, deviceId_hex, 0x02, commandFormat_hex, command_hex]
-
-	if (cue_hex !== null) {
-		message.push(cue_hex)
-	}
-
-	if (cueList_hex !== null) {
-		message.push(0x00)
-		message.push(cueList_hex)
-	}
-
-	if (cuePath_hex !== null) {
-		message.push(0x00)
-		message.push(cuePath_hex)
-	}
-
-	message.push(0xf7)
-
-	return _.flatten(message)
-}
-
-function stringToByteArray(str) {
-	if (str.toString) {
-		str = str.toString()
-	}
-
-	var ret = []
-	for (var i = 0; i < str.length; i++) {
-		var char = parseInt(str.charCodeAt(i))
-		ret.push(char)
-	}
-	return ret
+	msg.push(0xf7) // End of SysEx
+	return msg
 }
 
 function parseStringDeviceId(deviceId) {
-	deviceId = deviceId.toLowerCase()
-	if (deviceId === 'all') {
-		return 0x7f
+	if (deviceId === 'all') return 0x7f
+	if (deviceId.startsWith('g')) {
+		const group = parseInt(deviceId.substring(1))
+		if (group >= 1 && group <= 15) return 0x70 + (group - 1)
 	}
-
-	var match = deviceId.match(/^G(\d{1,2})$/i)
-	if (match) {
-		var g = parseInt(match[1])
-		if (g < 1 || g > 15) {
-			throw new Error('Group numbers must be within 1 and 15.')
-		}
-		return 0x6f + g
-	}
-
-	throw new Error('Invalid deviceId.')
+	return 0x7f
 }
 
 function parseIntegerDeviceId(deviceId) {
-	if (deviceId >= 0x00 && deviceId <= 0x6f) {
-		return _.parseInt(deviceId)
-	}
-
-	throw new Error('Integer deviceIds must be between 0 (0x00) and 111 (0x6F)')
+	if (deviceId >= 0 && deviceId <= 111) return deviceId
+	return 0x7f
 }
 
-function CheckLog(midiPort, midiCommand, message, time) {
-	let passed = true
-
-	if (!global.MIDIRelaysLog) {
-		global.MIDIRelaysLog = []
-	}
-
-	for (let i = 0; i < global.MIDIRelaysLog.length; i++) {
-		if (global.MIDIRelaysLog[i].midiport === midiPort) {
-			if (global.MIDIRelaysLog[i].midicommand === midiCommand) {
-				if (global.MIDIRelaysLog[i].message === message) {
-					//check to see when it arrived, it could be a bounceback
-					if (time - global.MIDIRelaysLog[i].datetime < 15) {
-						//bounceback, send false
-						passed = false
-					}
-				}
-			}
-		}
-	}
-
-	CleanUpLog()
-
-	return passed
+function stringToMSCData(str) {
+	return str.split('').map((c) => c.charCodeAt(0))
 }
 
-function CleanUpLog() {
-	//loops through the array and removes anything older than 60000ms (1 minute)
-	let time = Date.now()
-
-	if (!global.MIDIRelaysLog) {
-		global.MIDIRelaysLog = []
-	}
-
-	for (let i = 0; i < global.MIDIRelaysLog.length; i++) {
-		if (time - global.MIDIRelaysLog[i].datetime > 60000) {
-			global.MIDIRelaysLog.splice(i, 1)
-			i--
-		}
+function parseMSC(message) {
+	return {
+		deviceid: message[2],
+		commandformat: message[4],
+		command: message[5],
+		raw: message,
 	}
 }
+
+// =============================================================================
+// Triggers
+// =============================================================================
 
 function loadMIDITriggers() {
-	let Triggers = config.get('triggers')
+	// Triggers are stored in config
+	const triggers = config.get('triggers') || []
+	global.MIDI_TRIGGERS = triggers
+}
 
-	for (let i = 0; i < Triggers.length; i++) {
-		let port = global.MIDI_INPUTS.find(({ name }) => name === Triggers[i].midiport)
+function processMIDITriggers(portName, midiType, midiData) {
+	const triggers = global.MIDI_TRIGGERS || []
 
-		if (port) {
-			if (!port.opened) {
-				OpenPort(Triggers[i].midiport)
-				break
-			}
+	for (const trigger of triggers) {
+		if (matchesTrigger(trigger, portName, midiType, midiData)) {
+			executeTrigger(trigger, midiData)
 		}
 	}
 }
 
-function receiveMIDI(portName, message) {
-	const status = message[0] >> 4
-	const channel = message[0] & 0xf
-	const data1 = message[1]
-	const data2 = message[2]
+function matchesTrigger(trigger, portName, midiType, midiData) {
+	// Check MIDI command type
+	if (trigger.midicommand.toLowerCase() !== midiType) return false
 
-	let midiObj = {
-		midiport: portName,
-		rawmessage: message.join(','),
-		channel: channel,
+	// Check port if specified
+	if (trigger.midiport && trigger.midiport !== '*' && trigger.midiport !== portName) return false
+
+	// Check channel (if applicable)
+	if (trigger.channel !== undefined && trigger.channel !== '*') {
+		if (parseInt(trigger.channel) !== midiData.channel) return false
 	}
 
-	console.log('MIDI message received:')
-	console.log('Port:', portName)
-	console.log('Status:', status)
-	console.log('Channel:', channel)
-	console.log('Data1:', data1)
-	console.log('Data2:', data2)
-	console.log('Raw message:', message.join(','))
-
-	switch (status) {
-		case 8:
-			midiObj.midicommand = 'noteoff'
-			midiObj.note = data1
-			midiObj.velocity = data2
-			break
-		case 9:
-			midiObj.midicommand = 'noteon'
-			midiObj.note = data1
-			midiObj.velocity = data2
-			break
-		case 11:
-			midiObj.midicommand = 'cc'
-			midiObj.controller = data1
-			midiObj.value = data2
-			break
-		case 12:
-			midiObj.midicommand = 'pc'
-			midiObj.value = data1
-			break
-		case 13:
-			midiObj.midicommand = 'pressure'
-			midiObj.value = data1
-			break
-		case 14:
-			midiObj.midicommand = 'pitchbend'
-			midiObj.value = data1 + (data2 << 7)
-			break
-		case 15:
-			midiObj.midicommand = 'sysex'
-			midiObj.message = message.join(',')
-			break
-		default:
-			midiObj.midicommand = 'unsupported'
+	// Check note (for note on/off)
+	if ((midiType === 'noteon' || midiType === 'noteoff') && trigger.note !== undefined) {
+		if (trigger.note !== '*' && parseInt(trigger.note) !== midiData.note) return false
 	}
 
-	processMIDI(midiObj)
-	global.sendMIDIBack(midiObj)
+	// Check velocity (optional)
+	if (trigger.velocity !== undefined && trigger.velocity !== '*') {
+		if (parseInt(trigger.velocity) !== midiData.velocity) return false
+	}
+
+	// Check controller (for CC)
+	if (midiType === 'cc' && trigger.controller !== undefined) {
+		if (trigger.controller !== '*' && parseInt(trigger.controller) !== midiData.controller) return false
+	}
+
+	// Check value (for CC, PC, etc.)
+	if (trigger.value !== undefined && trigger.value !== '*') {
+		if (parseInt(trigger.value) !== midiData.value) return false
+	}
+
+	return true
 }
 
-function processMIDI(midiObj) {
-	let Triggers = config.get('triggers')
+async function executeTrigger(trigger, midiData) {
+	console.log('Executing trigger:', trigger.id)
 
-	let port = global.MIDI_INPUTS.find(({ name }) => name === midiObj.midiport)
-
-	if (port.opened) {
-		let passed = true
-		passed = CheckLog(midiObj.midiport, midiObj.midicommand, midiObj.rawmessage, Date.now()) //debounce, make sure we didn't already process this message
-		if (passed) {
-			for (let i = 0; i < Triggers.length; i++) {
-				if (Triggers[i].midiport === midiObj.midiport && Triggers[i].midicommand === midiObj.midicommand) {
-					switch (Triggers[i].midicommand) {
-						case 'noteon':
-						case 'noteoff':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].note) === parseInt(midiObj.note)) {
-									if (parseInt(Triggers[i].velocity) === parseInt(midiObj.velocity) || Triggers[i].velocity === '*') {
-										//trigger is a match, run the trigger
-										setTimeout(runMIDITrigger, 1, Triggers[i])
-									}
-								}
-							}
-							break
-						case 'aftertouch':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].note) === parseInt(midiObj.note)) {
-									if (parseInt(Triggers[i].value) === parseInt(midiObj.value) || Triggers[i].value === '*') {
-										//trigger is a match, run the trigger
-										setTimeout(runMIDITrigger, 1, Triggers[i])
-									}
-								}
-							}
-							break
-						case 'cc':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].controller) === parseInt(midiObj.controller)) {
-									if (parseInt(Triggers[i].value) === parseInt(midiObj.value) || Triggers[i].value === '*') {
-										//trigger is a match, run the trigger
-										setTimeout(runMIDITrigger, 1, Triggers[i])
-									}
-								}
-							}
-							break
-						case 'pc':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].value) === parseInt(midiObj.value) || Triggers[i].value === '*') {
-									//trigger is a match, run the trigger
-									setTimeout(runMIDITrigger, 1, Triggers[i])
-								}
-							}
-							break
-						case 'pressure':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].value) === parseInt(midiObj.value) || Triggers[i].value === '*') {
-									//trigger is a match, run the trigger
-									setTimeout(runMIDITrigger, 1, Triggers[i])
-								}
-							}
-							break
-						case 'pitchbend':
-							if (parseInt(Triggers[i].channel) === parseInt(midiObj.channel) || Triggers[i].channel === '*') {
-								if (parseInt(Triggers[i].value) === parseInt(midiObj.value) || Triggers[i].value === '*') {
-									//trigger is a match, run the trigger
-									setTimeout(runMIDITrigger, 1, Triggers[i])
-								}
-							}
-							break
-						case 'sysex':
-							if (Triggers[i].message === midiObj.message) {
-								setTimeout(runMIDITrigger, 1, Triggers[i])
-							}
-							break
-						default:
-							break
-					}
-				}
-			}
-		}
-	}
-}
-
-function runMIDITrigger(midiTriggerObj) {
-	switch (midiTriggerObj.actiontype) {
+	switch (trigger.actiontype) {
 		case 'http':
-			runMIDITrigger_HTTP(midiTriggerObj)
+			await runMIDITrigger_HTTP(trigger)
+			break
+		case 'midi':
+			await runMIDITrigger_MIDI(trigger)
 			break
 		default:
-			break
+			console.warn('Unknown trigger action type:', trigger.actiontype)
 	}
 }
 
-function runMIDITrigger_HTTP(midiTriggerObj) {
+// =============================================================================
+// HTTP Trigger Action
+// =============================================================================
+
+async function runMIDITrigger_HTTP(midiTriggerObj) {
+	let explicitMethod = (midiTriggerObj.method || '').toString().trim().toUpperCase()
+	let method = explicitMethod || (midiTriggerObj.jsondata ? 'POST' : 'GET')
+
+	const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+	if (!allowedMethods.has(method)) {
+		method = midiTriggerObj.jsondata ? 'POST' : 'GET'
+	}
+
+	const timeoutMs = config.get('httpTimeout') || 5000
+	const controller = new AbortController()
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+	const fetchOptions = {
+		method,
+		signal: controller.signal,
+	}
+
 	if (midiTriggerObj.jsondata) {
-		//if JSON data is present, send as HTTP POST with the data, otherwise send it as GET
 		try {
-			request.post(
-				midiTriggerObj.url,
-				{ json: JSON.parse(midiTriggerObj.jsondata), strictSSL: false },
-				function (error, response, body) {
-					if (!error && response.statusCode == 200) {
-						console.log(body)
-					} else {
-						console.log(error)
-						console.log(response)
-						console.log(body)
-					}
-				},
-			)
-		} catch (error) {}
-	} else {
-		http
-			.get(midiTriggerObj.url, (resp) => {
-				let data = ''
+			JSON.parse(midiTriggerObj.jsondata)
+			fetchOptions.headers = { 'Content-Type': 'application/json' }
+			fetchOptions.body = midiTriggerObj.jsondata
+		} catch (error) {
+			console.log(error)
+			addToLog('APP-ERR', 'HTTP ' + method, midiTriggerObj.url, { error: 'Invalid JSON: ' + error.message })
+			return
+		}
+	} else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+		fetchOptions.headers = { 'Content-Type': 'application/json' }
+		fetchOptions.body = '{}'
+	}
 
-				resp.on('data', (chunk) => {
-					data += chunk
-				})
+	try {
+		const response = await fetch(midiTriggerObj.url, fetchOptions)
+		clearTimeout(timeoutId)
+		const responseBody = await response.text()
 
-				resp.on('end', () => {
-					console.log(data)
-				})
+		if (response.ok) {
+			console.log(responseBody)
+			addToLog('TRIGGER', 'HTTP ' + method, midiTriggerObj.url, { status: response.status })
+		} else {
+			console.log(response.status)
+			console.log(responseBody)
+			addToLog('APP-ERR', 'HTTP ' + method, midiTriggerObj.url, {
+				error: 'Status Error',
+				status: response.status,
 			})
-			.on('error', (err) => {
-				console.log('Error: ' + err.message)
-			})
+		}
+	} catch (error) {
+		clearTimeout(timeoutId)
+		let errorMsg = error.message
+		if (error.name === 'AbortError') {
+			errorMsg = `Timeout after ${timeoutMs}ms - server not responding`
+		} else if (error.cause?.code === 'ECONNREFUSED') {
+			errorMsg = 'Connection refused - server not running on that port'
+		} else if (error.cause?.code === 'ENOTFOUND') {
+			errorMsg = 'Host not found - check hostname/IP'
+		}
+		console.log(`HTTP Trigger Error: ${errorMsg}`)
+		addToLog('APP-ERR', 'HTTP ' + method, midiTriggerObj.url, {
+			error: errorMsg,
+			status: 'N/A',
+		})
 	}
 }
+
+async function runMIDITrigger_MIDI(trigger) {
+	// Send MIDI to another port
+	const midiObj = {
+		midiport: trigger.outputport,
+		midicommand: trigger.outputcommand || trigger.midicommand,
+		channel: trigger.outputchannel ?? trigger.channel,
+		note: trigger.outputnote ?? trigger.note,
+		velocity: trigger.outputvelocity ?? trigger.velocity,
+		controller: trigger.outputcontroller ?? trigger.controller,
+		value: trigger.outputvalue ?? trigger.value,
+	}
+
+	sendMIDI(midiObj, (result) => {
+		if (result.result === 'midi-sent-successfully') {
+			addToLog('TRIGGER', 'MIDI', trigger.outputport, midiObj)
+		} else {
+			addToLog('APP-ERR', 'MIDI Trigger', trigger.outputport, { error: result.error || result.result })
+		}
+	})
+}
+
+// =============================================================================
+// Trigger CRUD
+// =============================================================================
 
 function uuidv4() {
-	//unique UUID generator for IDs
 	return 'xxxxxxxx'.replace(/[xy]/g, function (c) {
 		var r = (Math.random() * 16) | 0,
 			v = c === 'x' ? r : (r & 0x3) | 0x8
@@ -611,377 +629,339 @@ function uuidv4() {
 	})
 }
 
-function isHex(h) {
-	let a = parseInt(h, 16)
-	return a.toString(16) === h.toLowerCase()
-}
-
 function addTrigger(triggerObj) {
-	//add the Trigger to the array
 	triggerObj.id = 'trigger-' + uuidv4()
-
-	switch (triggerObj.midicommand) {
-		case 'noteon':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.velocity)) {
-				if (triggerObj.velocity !== '*') {
-					triggerObj.velocity = 1
-				}
-			}
-			break
-		case 'noteoff':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.velocity)) {
-				if (triggerObj.velocity !== '*') {
-					triggerObj.velocity = 0
-				}
-			}
-			break
-		case 'aftertouch':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'cc':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.controller)) {
-				triggerObj.controller = 21
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pc':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pressure':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pitchbend':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				triggerObj.value = 0
-			}
-			break
-		case 'sysex':
-			let msgArray = triggerObj.message.replace(' ', ',').split(',')
-			triggerObj.message = ''
-			for (let i = 0; i < msgArray.length; i++) {
-				if (isHex(msgArray[i])) {
-					//convert hex to dec
-					triggerObj.message += parseInt(msgArray[i], 16)
-				} else {
-					//assume dec
-					triggerObj.message += parseInt(msgArray[i])
-				}
-				if (i < msgArray - 1) {
-					triggerObj.message += ','
-				}
-			}
-			break
-		default:
-			break
-	}
-
-	let Triggers = config.get('triggers')
-	Triggers.push(triggerObj)
-	config.set('triggers', Triggers)
-
-	if (triggerObj.midiport) {
-		for (let i = 0; i < global.MIDI_INPUTS.length; i++) {
-			if (global.MIDI_INPUTS[i].name === triggerObj.midiport) {
-				if (!global.MIDI_INPUTS[i].opened) {
-					OpenPort(triggerObj.midiport)
-				}
-			}
-		}
-	}
+	const triggers = config.get('triggers') || []
+	triggers.push(triggerObj)
+	config.set('triggers', triggers)
+	global.MIDI_TRIGGERS = triggers
+	return triggerObj
 }
 
 function updateTrigger(triggerObj) {
-	//update the Trigger in the array
-	let Triggers = config.get('triggers')
+	const triggers = config.get('triggers') || []
+	const index = triggers.findIndex((t) => t.id === triggerObj.id)
+	if (index !== -1) {
+		triggers[index] = triggerObj
+		config.set('triggers', triggers)
+		global.MIDI_TRIGGERS = triggers
+		return true
+	}
+	return false
+}
 
-	switch (triggerObj.midicommand) {
-		case 'noteon':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.velocity)) {
-				if (triggerObj.velocity !== '*') {
-					triggerObj.velocity = 1
-				}
-			}
-			break
-		case 'noteoff':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.velocity)) {
-				if (triggerObj.velocity !== '*') {
-					triggerObj.velocity = 0
-				}
-			}
-			break
-		case 'aftertouch':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.note)) {
-				triggerObj.note = 21
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'cc':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.controller)) {
-				triggerObj.controller = 21
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pc':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pressure':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				if (triggerObj.value !== '*') {
-					triggerObj.value = 0
-				}
-			}
-			break
-		case 'pitchbend':
-			if (!Number.isInteger(triggerObj.channel)) {
-				if (triggerObj.channel !== '*') {
-					triggerObj.channel = 0
-				}
-			}
-			if (!Number.isInteger(triggerObj.value)) {
-				triggerObj.value = 0
-			}
-			break
-		case 'sysex':
-			let msgArray = triggerObj.message.replace(' ', ',').split(',')
-			triggerObj.message = ''
-			for (let i = 0; i < msgArray.length; i++) {
-				if (isHex(msgArray[i])) {
-					//convert hex to dec
-					triggerObj.message += parseInt(msgArray[i], 16)
-				} else {
-					//assume dec
-					triggerObj.message += parseInt(msgArray[i])
-				}
-				if (i < msgArray - 1) {
-					triggerObj.message += ','
-				}
-			}
-			break
-		default:
-			break
+function deleteTrigger(triggerId) {
+	const triggers = config.get('triggers') || []
+	const filtered = triggers.filter((t) => t.id !== triggerId)
+	if (filtered.length !== triggers.length) {
+		config.set('triggers', filtered)
+		global.MIDI_TRIGGERS = filtered
+		return true
+	}
+	return false
+}
+
+async function testTrigger(triggerId) {
+	const triggers = config.get('triggers') || []
+	const trigger = triggers.find((t) => t.id === triggerId)
+
+	if (!trigger) {
+		return { success: false, error: 'Trigger not found' }
 	}
 
-	let tempTriggers = []
-	tempTriggers.push(triggerObj)
-	Triggers = Triggers.map((obj) => tempTriggers.find((o) => o.id === obj.id) || obj)
+	if (trigger.actiontype === 'http') {
+		const timeoutMs = config.get('httpTimeout') || 5000
+		const controller = new AbortController()
+		const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
-	if (triggerObj.midiport) {
-		for (let i = 0; i < global.MIDI_INPUTS.length; i++) {
-			if (global.MIDI_INPUTS[i].name === triggerObj.midiport) {
-				if (!global.MIDI_INPUTS[i].opened) {
-					OpenPort(triggerObj.midiport)
-				}
+		try {
+			const method = trigger.method || (trigger.jsondata ? 'POST' : 'GET')
+			const fetchOptions = {
+				method,
+				signal: controller.signal,
 			}
+
+			if (trigger.jsondata) {
+				fetchOptions.headers = { 'Content-Type': 'application/json' }
+				fetchOptions.body = trigger.jsondata
+			}
+
+			const response = await fetch(trigger.url, fetchOptions)
+			clearTimeout(timeoutId)
+			const body = await response.text()
+
+			return {
+				success: response.ok,
+				status: response.status,
+				statusText: response.statusText,
+				body: body.substring(0, 500),
+			}
+		} catch (error) {
+			clearTimeout(timeoutId)
+			let errorMsg = error.message
+			if (error.name === 'AbortError') {
+				errorMsg = `Timeout after ${timeoutMs}ms`
+			}
+			return { success: false, error: errorMsg }
 		}
 	}
 
-	config.set('triggers', Triggers)
+	return { success: false, error: 'Test not supported for this action type' }
 }
 
-function deleteTrigger(triggerID) {
-	//delete the specified trigger from the array
-	let Triggers = config.get('triggers')
-	Triggers.find((o, i) => {
-		if (o.id === triggerID) {
-			Triggers.splice(i, 1)
-		}
-	})
-
-	config.set('triggers', Triggers)
-}
+// =============================================================================
+// Input Enable/Disable
+// =============================================================================
 
 function toggleInputDisabled(inputId) {
-	let disabledInputs = config.get('disabledInputs')
-	const wasDisabled = disabledInputs.includes(inputId)
+	const disabledInputs = config.get('disabledInputs') || []
+	const index = disabledInputs.indexOf(inputId)
 
-	//get name from id
-	const input = global.MIDI_INPUTS.find((p) => p.id === inputId)
-	if (!input) {
-		console.warn(`MIDI Input with ID ${inputId} not found.`)
-		return
-	}
-	const inputName = input.name
-
-	// Toggle state
-	if (wasDisabled) {
-		disabledInputs = disabledInputs.filter((id) => id !== inputId)
-	} else {
+	if (index === -1) {
 		disabledInputs.push(inputId)
+		ClosePort(inputId)
+	} else {
+		disabledInputs.splice(index, 1)
+		OpenPort(inputId)
 	}
 
 	config.set('disabledInputs', disabledInputs)
-
-	// Close the port if it's now disabled
-	if (!wasDisabled) {
-		const disabledInput = global.MIDI_INPUTS.find((p) => p.id === inputId && p.opened)
-		if (disabledInput) {
-			const input = inputMap.get(disabledInput.name)
-			if (input && typeof input.closePort === 'function') {
-				try {
-					input.closePort()
-					inputMap.delete(disabledInput.name)
-					disabledInput.opened = false
-				} catch (err) {
-					console.warn(`Error closing MIDI port ${disabledInput.name}:`, err)
-				}
-			}
-		}
-	}
-
-	// Show notification
-	notifications.showNotification({
-		title: `MIDI Input ${wasDisabled ? 'Enabled' : 'Disabled'}`,
-		body: `MIDI Input ${inputName} ${wasDisabled ? 'enabled' : 'disabled'}`,
-		showNotification: true,
-	})
-
-	// Refresh will attempt to open any now-enabled ports
-	refreshPorts()
 }
 
 function isInputDisabled(inputId) {
-	return config.get('disabledInputs').includes(inputId)
+	const disabledInputs = config.get('disabledInputs') || []
+	return disabledInputs.includes(inputId)
 }
 
+// =============================================================================
+// Startup
+// =============================================================================
+
+async function startMIDI() {
+	await initEngine()
+	await GetPorts(true)
+	await createVirtualMIDIPort()
+}
+
+// =============================================================================
+// Cleanup
+// =============================================================================
+
+async function closeMIDI() {
+	// Close all open inputs
+	for (const [name, input] of openInputs) {
+		try {
+			await input.close()
+		} catch (e) {
+			/* ignore */
+		}
+	}
+	openInputs.clear()
+
+	// Close all open outputs
+	for (const [name, output] of openOutputs) {
+		try {
+			await output.close()
+		} catch (e) {
+			/* ignore */
+		}
+	}
+	openOutputs.clear()
+
+	// Close JZZ engine
+	if (jzzEngine) {
+		try {
+			await jzzEngine.close()
+		} catch (e) {
+			/* ignore */
+		}
+		jzzEngine = null
+	}
+}
+
+// =============================================================================
+// Validation (same as before)
+// =============================================================================
+
+const MIDI_LIMITS = {
+	channel: { min: 0, max: 15, name: 'Channel' },
+	note: { min: 0, max: 127, name: 'Note' },
+	velocity: { min: 0, max: 127, name: 'Velocity' },
+	value: { min: 0, max: 127, name: 'Value' },
+	controller: { min: 0, max: 127, name: 'Controller' },
+	program: { min: 0, max: 127, name: 'Program' },
+	pitchbend: { min: 0, max: 16383, name: 'Pitch Bend' },
+}
+
+const VALID_MIDI_COMMANDS = ['noteon', 'noteoff', 'cc', 'pc', 'pressure', 'pitchbend', 'sysex', 'msc']
+
+function validateMIDIValue(paramName, value, allowWildcard = false) {
+	if (allowWildcard && value === '*') {
+		return { valid: true, value: '*' }
+	}
+
+	const limits = MIDI_LIMITS[paramName]
+	if (!limits) {
+		return { valid: false, error: `Unknown MIDI parameter: ${paramName}` }
+	}
+
+	const num = parseInt(value, 10)
+	if (isNaN(num)) {
+		return { valid: false, error: `${limits.name} must be a number, got: ${value}` }
+	}
+
+	if (num < limits.min || num > limits.max) {
+		return { valid: false, error: `${limits.name} must be ${limits.min}-${limits.max}, got: ${num}` }
+	}
+
+	return { valid: true, value: num }
+}
+
+function validateMIDIObject(midiObj) {
+	const errors = []
+
+	if (!midiObj) {
+		return { valid: false, errors: ['MIDI object is required'] }
+	}
+
+	if (!midiObj.midicommand) {
+		errors.push('midicommand is required')
+	} else if (!VALID_MIDI_COMMANDS.includes(midiObj.midicommand.toLowerCase())) {
+		errors.push(`Invalid midicommand: ${midiObj.midicommand}. Valid commands: ${VALID_MIDI_COMMANDS.join(', ')}`)
+	}
+
+	if (!midiObj.midiport) {
+		errors.push('midiport is required')
+	}
+
+	const command = (midiObj.midicommand || '').toLowerCase()
+
+	if (['noteon', 'noteoff', 'cc', 'pc', 'pressure', 'pitchbend'].includes(command)) {
+		if (midiObj.channel === undefined || midiObj.channel === null || midiObj.channel === '') {
+			errors.push('channel is required for ' + command)
+		} else {
+			const channelResult = validateMIDIValue('channel', midiObj.channel)
+			if (!channelResult.valid) errors.push(channelResult.error)
+		}
+	}
+
+	if (['noteon', 'noteoff'].includes(command)) {
+		if (midiObj.note === undefined || midiObj.note === null || midiObj.note === '') {
+			errors.push('note is required for ' + command)
+		} else {
+			const noteResult = validateMIDIValue('note', midiObj.note)
+			if (!noteResult.valid) errors.push(noteResult.error)
+		}
+	}
+
+	if (['noteon', 'noteoff'].includes(command) && midiObj.velocity !== undefined) {
+		const velResult = validateMIDIValue('velocity', midiObj.velocity)
+		if (!velResult.valid) errors.push(velResult.error)
+	}
+
+	if (command === 'cc') {
+		if (midiObj.controller === undefined || midiObj.controller === null || midiObj.controller === '') {
+			errors.push('controller is required for cc')
+		} else {
+			const ctrlResult = validateMIDIValue('controller', midiObj.controller)
+			if (!ctrlResult.valid) errors.push(ctrlResult.error)
+		}
+	}
+
+	if (['cc', 'pc', 'pressure'].includes(command)) {
+		if (midiObj.value === undefined || midiObj.value === null || midiObj.value === '') {
+			errors.push('value is required for ' + command)
+		} else {
+			const valResult = validateMIDIValue('value', midiObj.value)
+			if (!valResult.valid) errors.push(valResult.error)
+		}
+	}
+
+	if (command === 'pitchbend') {
+		if (midiObj.value === undefined || midiObj.value === null || midiObj.value === '') {
+			errors.push('value is required for pitchbend')
+		} else {
+			const pbResult = validateMIDIValue('pitchbend', midiObj.value)
+			if (!pbResult.valid) errors.push(pbResult.error)
+		}
+	}
+
+	return errors.length > 0 ? { valid: false, errors } : { valid: true }
+}
+
+function validateTriggerObject(triggerObj) {
+	const errors = []
+
+	if (!triggerObj) {
+		return { valid: false, errors: ['Trigger object is required'] }
+	}
+
+	if (!triggerObj.midicommand) {
+		errors.push('midicommand is required')
+	} else if (!VALID_MIDI_COMMANDS.includes(triggerObj.midicommand.toLowerCase())) {
+		errors.push(`Invalid midicommand: ${triggerObj.midicommand}`)
+	}
+
+	const command = (triggerObj.midicommand || '').toLowerCase()
+
+	// Validate channel (allow wildcards for triggers)
+	if (['noteon', 'noteoff', 'cc', 'pc', 'pressure', 'pitchbend'].includes(command)) {
+		if (triggerObj.channel !== undefined && triggerObj.channel !== '*') {
+			const result = validateMIDIValue('channel', triggerObj.channel)
+			if (!result.valid) errors.push(result.error)
+		}
+	}
+
+	// Validate note
+	if (['noteon', 'noteoff'].includes(command) && triggerObj.note !== undefined && triggerObj.note !== '*') {
+		const result = validateMIDIValue('note', triggerObj.note)
+		if (!result.valid) errors.push(result.error)
+	}
+
+	// Validate action type
+	if (!triggerObj.actiontype) {
+		errors.push('actiontype is required')
+	} else if (!['http', 'midi'].includes(triggerObj.actiontype)) {
+		errors.push(`Invalid actiontype: ${triggerObj.actiontype}. Valid types: http, midi`)
+	}
+
+	// HTTP action requires URL
+	if (triggerObj.actiontype === 'http' && !triggerObj.url) {
+		errors.push('url is required for http action')
+	}
+
+	// MIDI action requires output port
+	if (triggerObj.actiontype === 'midi' && !triggerObj.outputport) {
+		errors.push('outputport is required for midi action')
+	}
+
+	return errors.length > 0 ? { valid: false, errors } : { valid: true }
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
 module.exports = {
-	startMIDI() {
-		createVirtualMIDIPort()
-		GetPorts(true)
-	},
-
-	sendMIDI(midiObj, callback) {
-		sendMIDI(midiObj, callback)
-	},
-
-	refreshPorts() {
-		refreshPorts()
-	},
-
-	addTrigger(triggerObj) {
-		addTrigger(triggerObj)
-	},
-
-	updateTrigger(triggerObj) {
-		updateTrigger(triggerObj)
-	},
-
-	deleteTrigger(triggerId) {
-		deleteTrigger(triggerId)
-	},
-
-	toggleInputDisabled(inputId) {
-		toggleInputDisabled(inputId)
-	},
-
-	isInputDisabled(inputId) {
-		return isInputDisabled(inputId)
-	},
+	startMIDI,
+	closeMIDI,
+	GetPorts,
+	OpenPort,
+	ClosePort,
+	refreshPorts,
+	sendMIDI,
+	createVirtualMIDIPort,
+	addTrigger,
+	updateTrigger,
+	deleteTrigger,
+	testTrigger,
+	toggleInputDisabled,
+	isInputDisabled,
+	loadMIDITriggers,
+	// Validation
+	validateMIDIValue,
+	validateMIDIObject,
+	validateTriggerObject,
+	MIDI_LIMITS,
+	VALID_MIDI_COMMANDS,
 }
